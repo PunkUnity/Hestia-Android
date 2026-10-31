@@ -44,6 +44,11 @@ jobs:
           yes | sdkmanager --licenses > /dev/null || true
       - name: Prepare Gradle
         run: chmod +x gradlew
+      - name: Sign test builds with one fixed debug key
+        # Each runner makes a new debug key, and Android refuses to update an
+        # app signed by another. A fixed one lets each test build install over
+        # the last. Debug only; test branch only.
+        run: mkdir -p ~/.android && cp .github/dev-debug.keystore ~/.android/debug.keystore
       - name: Compile Android variants
         run: ./gradlew --no-daemon :app:assembleNonRoot_gameDebug :app:assembleRootDebug
       - name: Check package IDs of built APKs
