@@ -83,6 +83,14 @@ jobs:
           path: app/build/outputs/apk/**/debug/*.apk
           if-no-files-found: warn
           retention-days: 7
+      - name: Upload the phone build alone
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: hestia-dev-arm64
+          path: app/build/outputs/apk/nonRoot_game/debug/*arm64-v8a*.apk
+          if-no-files-found: warn
+          retention-days: 7
       - name: Upload JVM test reports
         if: always()
         uses: actions/upload-artifact@v6
