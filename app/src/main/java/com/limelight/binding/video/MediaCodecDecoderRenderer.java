@@ -1100,7 +1100,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
 
         // Don't render unless a new frame is due. This prevents microstutter when streaming
         // at a frame rate that doesn't match the display (such as 60 FPS on 120 Hz).
-        pacingDiag.choreoCallback();
+        pacingDiag.choreoCallback(frameTimeNanos);
         long actualFrameTimeDeltaNs = frameTimeNanos - lastRenderedFrameTimeNanos;
         long expectedFrameTimeDeltaNs = 800000000 / refreshRate; // within 80% of the next frame
         if (actualFrameTimeDeltaNs >= expectedFrameTimeDeltaNs) {
@@ -1301,7 +1301,9 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
 
                     try {
                         // Try to output a frame
+                        final long diagDequeueStartNs = System.nanoTime();
                         int outIndex = videoDecoder.dequeueOutputBuffer(info, getOutputDequeueTimeoutUs());
+                        if (outIndex >= 0) pacingDiag.dequeueTook(System.nanoTime() - diagDequeueStartNs);
 
                         if (outIndex == MediaCodec.INFO_TRY_AGAIN_LATER) {
                             // reduced backoff 0–500 µs
@@ -1510,7 +1512,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                                 }
 
                                 // Add this buffer
-                                pacingDiag.queued(lastIndex, presentationTimeUs);
+                                pacingDiag.queued(lastIndex, presentationTimeUs, outputBufferQueue.size());
                                 outputBufferQueue.add(lastIndex);
                                 // NB: in BALANCED non presentiamo qui; lasciamo il fallback stats sotto
                             }

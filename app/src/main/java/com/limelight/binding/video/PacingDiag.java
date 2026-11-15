@@ -34,6 +34,64 @@ final class PacingDiag {
     private static final int MAX_EXAMPLES = 4;
     private static final int PTS_SLOTS = 64;
 
+    /**
+     * Collects durations (in microseconds) from one writer thread and reports
+     * percentiles per window. Bounded: at most CAPACITY samples per window.
+     */
+    static final class Stat {
+        private static final int CAPACITY = 4096;
+        private final long[] values = new long[CAPACITY];
+        private int count;
+        private long max;
+        private long dropped;
+
+        synchronized void add(long us) {
+            if (us < 0) return;
+            if (us > max) max = us;
+            if (count < CAPACITY) values[count++] = us; else dropped++;
+        }
+
+        /** "p50/p90/p99/max ms (n)" for this window, then reset. */
+        synchronized String takeSummary() {
+            if (count == 0) return "-";
+            long[] v = java.util.Arrays.copyOf(values, count);
+            java.util.Arrays.sort(v);
+            String s = ms(v[(int) (0.50 * (count - 1))]) + "/" + ms(v[(int) (0.90 * (count - 1))]) + "/"
+                    + ms(v[(int) (0.99 * (count - 1))]) + "/" + ms(max) + "ms(n=" + (count + dropped) + ")";
+            count = 0; max = 0; dropped = 0;
+            return s;
+        }
+
+        private static String ms(long us) {
+            return String.format(java.util.Locale.US, "%.1f", us / 1000.0);
+        }
+    }
+
+    // Timing, per window. Each Stat has a single writer thread (noted).
+    private final Stat submitGap = new Stat();    // between submitDecodeUnit calls (input thread)
+    private final Stat outputGap = new Stat();    // between decoder outputs (render thread)
+    private final Stat dequeueTime = new Stat();  // timed dequeue that returned a frame (render thread)
+    private final Stat queueAge = new Stat();     // enqueue -> taken by Choreographer (Choreographer thread)
+    private final Stat choreoLate = new Stat();   // callback entry minus vsync frame time, which the
+                                                  // renderer has already moved earlier by the app vsync
+                                                  // offset, so this includes that offset (Choreographer thread)
+    private final AtomicLong[] depthAtEnqueue = {new AtomicLong(), new AtomicLong(), new AtomicLong()};
+    private final AtomicLongArray enqueueNsByIndex = new AtomicLongArray(PTS_SLOTS);
+    private long lastSubmitNs;   // input thread only
+    private long lastOutputNs;   // render thread only
+
+    // Individual long gaps, logged as they happen (rate-limited), to place hitches in a stage.
+    private static final long LONG_GAP_US = 50_000;
+    private static final int MAX_GAP_EVENTS_PER_WINDOW = 6;
+    private final java.util.concurrent.atomic.AtomicInteger gapEvents = new java.util.concurrent.atomic.AtomicInteger();
+
+    private void longGap(String stage, long us) {
+        if (us >= LONG_GAP_US && gapEvents.incrementAndGet() <= MAX_GAP_EVENTS_PER_WINDOW) {
+            LimeLog.info("PacingDiag gap: stage=" + stage + " gapMs=" + (us / 1000)
+                    + " t=" + ((System.nanoTime() - sessionStartNs) / 1_000_000L) + "ms");
+        }
+    }
+
     private final AtomicLong submitted = new AtomicLong();
     private final AtomicLong output = new AtomicLong();
     private final AtomicLong latestDrop = new AtomicLong();
@@ -77,10 +135,30 @@ final class PacingDiag {
     private long windowStartNs = System.nanoTime();
     private long sessionStartNs = windowStartNs;
 
-    void submitted() { submitted.incrementAndGet(); }
+    /** A frame was submitted to the decoder. Input thread only. */
+    void submitted() {
+        submitted.incrementAndGet();
+        long now = System.nanoTime();
+        if (lastSubmitNs != 0) {
+            long us = (now - lastSubmitNs) / 1000;
+            submitGap.add(us);
+            longGap("submit", us);
+        }
+        lastSubmitNs = now;
+    }
+
+    /** Duration of a timed dequeue that returned a frame. Render thread only. */
+    void dequeueTook(long ns) { dequeueTime.add(ns / 1000); }
     /** The decoder returned an output buffer. Render thread only. */
     void output(long ptsUs) {
         output.incrementAndGet();
+        long now = System.nanoTime();
+        if (lastOutputNs != 0) {
+            long us = (now - lastOutputNs) / 1000;
+            outputGap.add(us);
+            longGap("output", us);
+        }
+        lastOutputNs = now;
         if (ptsUs >= 0) {
             if (lastOutputPtsUs >= 0 && ptsUs < lastOutputPtsUs) {
                 // The decoder itself returned frames out of timestamp order.
@@ -94,7 +172,11 @@ final class PacingDiag {
     void drainDrop() { drainDrop.incrementAndGet(); }
     void lateDrop() { lateDrop.incrementAndGet(); }
     void queueDrop() { queueDrop.incrementAndGet(); }
-    void choreoCallback() { choreoCallbacks.incrementAndGet(); }
+    /** A Choreographer callback ran for the vsync at frameTimeNanos. Choreographer thread only. */
+    void choreoCallback(long frameTimeNanos) {
+        choreoCallbacks.incrementAndGet();
+        choreoLate.add((System.nanoTime() - frameTimeNanos) / 1000);
+    }
     void choreoEmpty() { choreoEmpty.incrementAndGet(); }
     /**
      * The decoder was flushed, restarted or reset and the Balanced queue was cleared.
@@ -105,6 +187,7 @@ final class PacingDiag {
         resets.incrementAndGet();
         for (int i = 0; i < PTS_SLOTS; i++) {
             ptsByIndex.set(i, -1);
+            enqueueNsByIndex.set(i, 0);
         }
         lastOutputPtsUs = -1;
         synchronized (this) {
@@ -114,10 +197,12 @@ final class PacingDiag {
     }
 
     /** A frame was put in the Balanced queue for the Choreographer to release. */
-    void queued(int bufferIndex, long ptsUs) {
+    void queued(int bufferIndex, long ptsUs, int depthBefore) {
         queued.incrementAndGet();
+        depthAtEnqueue[Math.max(0, Math.min(2, depthBefore))].incrementAndGet();
         if (bufferIndex >= 0 && bufferIndex < PTS_SLOTS) {
             ptsByIndex.set(bufferIndex, ptsUs);
+            enqueueNsByIndex.set(bufferIndex, System.nanoTime());
         }
     }
 
@@ -125,6 +210,7 @@ final class PacingDiag {
     void dropQueued(int bufferIndex) {
         if (bufferIndex >= 0 && bufferIndex < PTS_SLOTS) {
             ptsByIndex.set(bufferIndex, -1);
+            enqueueNsByIndex.set(bufferIndex, 0);
         }
     }
 
@@ -135,6 +221,10 @@ final class PacingDiag {
      */
     long takePts(int bufferIndex) {
         if (bufferIndex >= 0 && bufferIndex < PTS_SLOTS) {
+            long enqNs = enqueueNsByIndex.getAndSet(bufferIndex, 0);
+            if (enqNs != 0) {
+                queueAge.add((System.nanoTime() - enqNs) / 1000);
+            }
             return ptsByIndex.getAndSet(bufferIndex, -1);
         }
         return -1;
@@ -238,5 +328,13 @@ final class PacingDiag {
         }
         windowStartNs = now;
         LimeLog.info(sb.toString());
+        LimeLog.info("PacingDiag timing: submitGap=" + submitGap.takeSummary()
+                + " outputGap=" + outputGap.takeSummary()
+                + " dequeue=" + dequeueTime.takeSummary()
+                + " queueAge=" + queueAge.takeSummary()
+                + " choreoLate=" + choreoLate.takeSummary()
+                + " depthAtEnqueue=" + depthAtEnqueue[0].getAndSet(0) + "/" + depthAtEnqueue[1].getAndSet(0)
+                + "/" + depthAtEnqueue[2].getAndSet(0)
+                + " gapEvents=" + gapEvents.getAndSet(0));
     }
 }
