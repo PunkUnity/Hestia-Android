@@ -44,6 +44,10 @@ jobs:
           yes | sdkmanager --licenses > /dev/null || true
       - name: Prepare Gradle
         run: chmod +x gradlew
+      - name: Use the fixed test signing key for debug builds
+        run: |
+          mkdir -p "$HOME/.android"
+          cp .github/test-signing/debug.keystore "$HOME/.android/debug.keystore"
       - name: Compile Android variants
         run: ./gradlew --no-daemon :app:assembleNonRoot_gameDebug :app:assembleRootDebug
       - name: Check package IDs of built APKs
