@@ -48,6 +48,9 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
     // Set true to enable a 'latest-only' fast path in the render loop.
     private boolean preferLowerDelays = false;
 
+    // Diagnostic counters only; never changes what is released or when.
+    private final PacingDiag pacingDiag = new PacingDiag();
+
 
     // Force tight thresholds regardless of device refresh (use vsyncPeriodNs always)
     private volatile boolean forceTightThresholds = false;
@@ -844,6 +847,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                 nextInputBuffer = null;
                 nextInputBufferIndex = -1;
                 outputBufferQueue.clear();
+                pacingDiag.resetEvent();
 
                 // If we just need a flush, do so now with all threads quiesced.
                 if (codecRecoveryType.get() == CR_RECOVERY_TYPE_FLUSH) {
@@ -1093,6 +1097,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
 
         // Don't render unless a new frame is due. This prevents microstutter when streaming
         // at a frame rate that doesn't match the display (such as 60 FPS on 120 Hz).
+        pacingDiag.choreoCallback();
         long actualFrameTimeDeltaNs = frameTimeNanos - lastRenderedFrameTimeNanos;
         long expectedFrameTimeDeltaNs = 800000000 / refreshRate; // within 80% of the next frame
         if (actualFrameTimeDeltaNs >= expectedFrameTimeDeltaNs) {
@@ -1102,6 +1107,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
             // by holding onto them for too long. This also ensures we will have that 1 extra
             // frame of buffer to smooth over network/rendering jitter.
             Integer nextOutputBuffer = outputBufferQueue.poll();
+            if (nextOutputBuffer == null) pacingDiag.choreoEmpty();
             if (nextOutputBuffer != null) {
                 try {
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
@@ -1125,6 +1131,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                     }
 
                     lastRenderedFrameTimeNanos = frameTimeNanos;
+                    pacingDiag.released(PacingDiag.PATH_CHOREO, pacingDiag.ptsOf(nextOutputBuffer), outputBufferQueue.size());
                     activeWindowVideoStats.totalFramesRendered++;
                 } catch (IllegalStateException ignored) {
                     try {
@@ -1222,8 +1229,17 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                 double ewmaJitterNs            = periodNs * 0.1;
 
                 BufferInfo info = new BufferInfo();
+                {
+                    String __diagDecoder = "unknown";
+                    try { __diagDecoder = videoDecoder.getName(); } catch (Throwable ignored) {}
+                    pacingDiag.session("decoder=" + __diagDecoder + " streamFps=" + tfps + " displayHz=" + displayHz
+                            + " appliedFramePacing=" + (prefs != null ? prefs.framePacing : -1)
+                            + " preferLowerDelays=" + preferLowerDelays + " dequeueTimeoutUs=" + getOutputDequeueTimeoutUs()
+                            + " forceTightThresholds=" + forceTightThresholds);
+                }
                 long lastOutputNs = System.nanoTime();
                 while (!stopping) {
+                    pacingDiag.maybeReport();
                     /* LATEST_ONLY_LOW_LATENCY */
                     if (!preferLowerDelays) {
                         try {
@@ -1236,8 +1252,10 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                             while (__idx >= 0) {
                                 if (__last >= 0) {
                                     try { videoDecoder.releaseOutputBuffer(__last, false); } catch (Throwable ignored) {}
+                                    pacingDiag.latestDrop();
                                 }
                                 __last = __idx;
+                                pacingDiag.output();
                                 __lastPtsUs = __tmpInfo.presentationTimeUs;
                                 __idx = videoDecoder.dequeueOutputBuffer(__tmpInfo, 0);
                             }
@@ -1248,6 +1266,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                                     releaseWithPolicy(__last, System.nanoTime());} else {
                                     releaseWithPolicy(__last, System.nanoTime());}
 
+                                pacingDiag.released(PacingDiag.PATH_LATEST, __lastPtsUs, outputBufferQueue.size());
                                 // Update decode->present EWMA and decode stats if we have a valid PTS
                                 if (__lastPtsUs >= 0) {
                                     long __d2pNs = __nowNs - (__lastPtsUs * 1000L);
@@ -1284,6 +1303,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                             int lastIndex = outIndex;
 
                             numFramesOut++;
+                            pacingDiag.output();
 
                             // aggiorna inter-arrival
                             if (lastDecoderPtsUs != 0L) {
@@ -1301,8 +1321,10 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                                 while ((outIndex = videoDecoder.dequeueOutputBuffer(info, getOutputDequeueTimeoutUs())) >= 0) {
                                     videoDecoder.releaseOutputBuffer(lastIndex, false);
                                     frameDropped = true; // we're discarding the oldest one
+                                    pacingDiag.drainDrop();
 
                                     numFramesOut++;
+                                    pacingDiag.output();
                                     lastIndex = outIndex;
                                     presentationTimeUs = info.presentationTimeUs;
                                 }
@@ -1331,6 +1353,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
 
                                             frameDropped = true;
                                             lastDropNs = nowNs;
+                                            pacingDiag.lateDrop();
                                             recentDrops = Math.min(10, recentDrops + 1);
                                             continue;
                                         }
@@ -1343,6 +1366,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                                         }
 
                                         lastPresentNs = nowNs;
+                                        pacingDiag.released(PacingDiag.PATH_DIRECT, presentationTimeUs, outputBufferQueue.size());
                                         recentDrops = Math.max(0, recentDrops - 1);
 
                                         // [STATS] update subito dopo il present
@@ -1404,6 +1428,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
 
                                             frameDropped = true;
                                             lastDropNs = nowNs;
+                                            pacingDiag.lateDrop();
                                             recentDrops = Math.min(10, recentDrops + 1);
                                             continue; // niente stats sui frame droppati
                                         }
@@ -1416,6 +1441,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                                         }
 
                                         lastPresentNs = nowNs;
+                                        pacingDiag.released(PacingDiag.PATH_DIRECT, presentationTimeUs, outputBufferQueue.size());
                                         if (!isLate) lateStreak = 0;
                                         recentDrops = Math.max(0, recentDrops - 1);
 
@@ -1454,6 +1480,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                                 if (outputBufferQueue.size() == OUTPUT_BUFFER_QUEUE_LIMIT) {
                                     try {
                                         videoDecoder.releaseOutputBuffer(outputBufferQueue.take(), false);
+                                        pacingDiag.queueDrop();
                                         frameDropped = true;
                                     } catch (InterruptedException e) {
                                         return;
@@ -1461,6 +1488,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                                 }
 
                                 // Add this buffer
+                                pacingDiag.queued(lastIndex, presentationTimeUs);
                                 outputBufferQueue.add(lastIndex);
                                 // NB: in BALANCED non presentiamo qui; lasciamo il fallback stats sotto
                             }
@@ -1491,6 +1519,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                     }
                 }
 
+                pacingDiag.finalReport();
                 /* WATCHDOG_C2_SLEEP */
                 try {
                     final long __nowNs = System.nanoTime();
@@ -2178,6 +2207,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         lastTimestampUs = timestampUs;
 
         numFramesIn++;
+        pacingDiag.submitted();
 
         if (decodeUnitLength > nextInputBuffer.limit() - nextInputBuffer.position()) {
             IllegalArgumentException exception = new IllegalArgumentException(
