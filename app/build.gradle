@@ -110,6 +110,17 @@ android {
     }
 
     signingConfigs {
+        // Test builds on this fork: sign debug APKs with one fixed test key so a new
+        // test build updates the previous one on a device. Not used for nightly or release.
+        def testKey = rootProject.file(".github/test-signing/debug.keystore")
+        if (testKey.exists()) {
+            debug {
+                storeFile testKey
+                storePassword "android"
+                keyAlias "androiddebugkey"
+                keyPassword "android"
+            }
+        }
         // When a persistent signing key is configured in GitHub Actions,
         // use it for nightlies, release candidates and stable releases.
         // Otherwise nightlies use the cloned debug config, which is valid for

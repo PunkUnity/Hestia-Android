@@ -50,6 +50,17 @@ jobs:
           cp .github/test-signing/debug.keystore "$HOME/.android/debug.keystore"
       - name: Compile Android variants
         run: ./gradlew --no-daemon :app:assembleNonRoot_gameDebug :app:assembleRootDebug
+      - name: Check debug APKs carry the fixed test key
+        shell: bash
+        run: |
+          set -euo pipefail
+          want="FE:2E:9B:54:D8:3D:5A:36:57:A1:05:C8:1E:20:84:77:55:32:63:12:CF:60:45:27:CE:4F:3C:93:4C:5E:A1:D9"
+          apksigner="$ANDROID_HOME/build-tools/36.0.0/apksigner"
+          for apk in app/build/outputs/apk/nonRoot_game/debug/*.apk; do
+            got="$("$apksigner" verify --print-certs "$apk" | sed -n 's/.*certificate SHA-256 digest: //p' | head -1 | tr 'a-f' 'A-F' | sed 's/../&:/g; s/:$//')"
+            echo "$apk: $got"
+            [[ "$got" == "$want" ]] || { echo "::error::$apk is not signed with the fixed test key"; exit 1; }
+          done
       - name: Check package IDs of built APKs
         shell: bash
         run: |
