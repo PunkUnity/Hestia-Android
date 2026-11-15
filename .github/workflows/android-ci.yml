@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
@@ -95,6 +95,20 @@ jobs:
           path: app/build/outputs/apk/nonRoot_game/debug/*arm64-v8a*.apk
           if-no-files-found: warn
           retention-days: 7
+      - name: Publish the arm64 debug APK as the dev-latest prerelease
+        # Test builds only: lets the device be updated with a plain download, no GitHub login.
+        if: success() && startsWith(github.ref_name, 'build/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          apk="$(find app/build/outputs/apk/nonRoot_game/debug -name '*arm64-v8a*.apk' -print -quit)"
+          cp "$apk" hestia-dev-arm64.apk
+          sha256sum hestia-dev-arm64.apk | tee hestia-dev-arm64.apk.sha256
+          notes="Test build from ${{ github.ref_name }} @ ${{ github.sha }}, run ${{ github.run_id }}. Debug build signed with the fixed test key. Not a release."
+          gh release delete dev-latest --cleanup-tag --yes || true
+          gh release create dev-latest hestia-dev-arm64.apk hestia-dev-arm64.apk.sha256 \
+            --prerelease --target "${{ github.sha }}" --title "Hestia Dev test build" --notes "$notes"
       - name: Upload JVM test reports
         if: always()
         uses: actions/upload-artifact@v6
