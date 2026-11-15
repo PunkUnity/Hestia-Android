@@ -47,8 +47,9 @@ final class PacingDiag {
     // so a reused index can't report a stale timestamp.
     private final AtomicLongArray ptsByIndex = new AtomicLongArray(PTS_SLOTS);
 
-    // Decoder output order, checked on the render thread only.
-    private long lastOutputPtsUs = -1;
+    // Decoder output order. Written by the render thread, and by whichever thread
+    // performs a codec reset while the others are quiesced.
+    private volatile long lastOutputPtsUs = -1;
     private final AtomicLong outputReversal = new AtomicLong();
 
     PacingDiag() {
@@ -90,7 +91,22 @@ final class PacingDiag {
     void queueDrop() { queueDrop.incrementAndGet(); }
     void choreoCallback() { choreoCallbacks.incrementAndGet(); }
     void choreoEmpty() { choreoEmpty.incrementAndGet(); }
-    void resetEvent() { resets.incrementAndGet(); }
+    /**
+     * The decoder was flushed, restarted or reset and the Balanced queue was cleared.
+     * Called with all codec threads quiesced. Forget buffer indices and ordering
+     * state from before the reset so they can't be compared with frames after it.
+     */
+    void resetEvent() {
+        resets.incrementAndGet();
+        for (int i = 0; i < PTS_SLOTS; i++) {
+            ptsByIndex.set(i, -1);
+        }
+        lastOutputPtsUs = -1;
+        synchronized (this) {
+            lastPtsUs = -1;
+            lastPath = -1;
+        }
+    }
 
     /** A frame was put in the Balanced queue for the Choreographer to release. */
     void queued(int bufferIndex, long ptsUs) {
