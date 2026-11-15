@@ -16,6 +16,10 @@ import java.util.concurrent.atomic.AtomicLongArray;
  *
  * A release call is not proof that the frame reached the screen. Compare these
  * counts with SurfaceFlinger presentation timestamps for the same window.
+ *
+ * Scope: success/failure accounting is exact for Balanced pacing (the queue and
+ * Choreographer path). The direct-release counts in the other pacing modes still
+ * count a release whose helper call failed; audit them before relying on them.
  */
 final class PacingDiag {
     /** Released by the non-blocking "latest frame only" block in the render thread. */
@@ -62,13 +66,14 @@ final class PacingDiag {
     private final long[] released = new long[PATH_NAMES.length];
     private long outOfOrder;
     private long releasedWhileQueued;
+    private long unknownPts;
     private long lastPtsUs = -1;
     private int lastPath = -1;
     private final StringBuilder examples = new StringBuilder();
     private int exampleCount;
 
     // Previous totals, for per-window deltas. Only touched by maybeReport().
-    private final long[] prev = new long[18];
+    private final long[] prev = new long[20];
     private long windowStartNs = System.nanoTime();
     private long sessionStartNs = windowStartNs;
 
@@ -155,6 +160,10 @@ final class PacingDiag {
             }
             lastPtsUs = ptsUs;
             lastPath = path;
+        } else {
+            // No PTS for this frame (index out of range, or never recorded), so it
+            // took no part in the order check.
+            unknownPts++;
         }
     }
 
@@ -180,7 +189,7 @@ final class PacingDiag {
     }
 
     private void report(long now) {
-        long[] cur = new long[18];
+        long[] cur = new long[20];
         String ex;
         synchronized (this) {
             cur[0] = submitted.get();
@@ -200,6 +209,7 @@ final class PacingDiag {
             cur[14] = resets.get();
             cur[15] = outputReversal.get();
             cur[16] = releaseFailed.get();
+            cur[17] = unknownPts;
             ex = examples.toString();
             examples.setLength(0);
             exampleCount = 0;
@@ -207,7 +217,7 @@ final class PacingDiag {
 
         String[] names = {"submitted", "output", "latestRel", "latestDrop", "queued", "queueDrop",
                 "choreoRel", "choreoEmpty", "choreoCallbacks", "directRel", "drainDrop", "lateDrop",
-                "relWhileQueued", "outOfOrder", "resets", "outputReversal", "releaseFailed"};
+                "relWhileQueued", "outOfOrder", "resets", "outputReversal", "releaseFailed", "unknownPts"};
         StringBuilder sb = new StringBuilder(320);
         sb.append("PacingDiag t=").append((now - sessionStartNs) / 1_000_000L).append("ms window=")
                 .append((now - windowStartNs) / 1_000_000L).append("ms");
