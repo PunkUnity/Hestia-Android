@@ -40,9 +40,22 @@ final class PacingDiag {
     private final AtomicLong choreoCallbacks = new AtomicLong();
     private final AtomicLong choreoEmpty = new AtomicLong();
     private final AtomicLong resets = new AtomicLong();
+    private final AtomicLong releaseFailed = new AtomicLong();
 
     // PTS of each buffer waiting in the Balanced queue, by output buffer index.
+    // -1 means unknown. A slot is cleared when its buffer is taken from the queue,
+    // so a reused index can't report a stale timestamp.
     private final AtomicLongArray ptsByIndex = new AtomicLongArray(PTS_SLOTS);
+
+    // Decoder output order, checked on the render thread only.
+    private long lastOutputPtsUs = -1;
+    private final AtomicLong outputReversal = new AtomicLong();
+
+    PacingDiag() {
+        for (int i = 0; i < PTS_SLOTS; i++) {
+            ptsByIndex.set(i, -1);
+        }
+    }
 
     // Guarded by "this": release bookkeeping shared by the render and Choreographer threads.
     private final long[] released = new long[PATH_NAMES.length];
@@ -54,12 +67,23 @@ final class PacingDiag {
     private int exampleCount;
 
     // Previous totals, for per-window deltas. Only touched by maybeReport().
-    private final long[] prev = new long[16];
+    private final long[] prev = new long[18];
     private long windowStartNs = System.nanoTime();
     private long sessionStartNs = windowStartNs;
 
     void submitted() { submitted.incrementAndGet(); }
-    void output() { output.incrementAndGet(); }
+    /** The decoder returned an output buffer. Render thread only. */
+    void output(long ptsUs) {
+        output.incrementAndGet();
+        if (ptsUs >= 0) {
+            if (lastOutputPtsUs >= 0 && ptsUs < lastOutputPtsUs) {
+                // The decoder itself returned frames out of timestamp order.
+                outputReversal.incrementAndGet();
+            }
+            lastOutputPtsUs = ptsUs;
+        }
+    }
+    void releaseFailed() { releaseFailed.incrementAndGet(); }
     void latestDrop() { latestDrop.incrementAndGet(); }
     void drainDrop() { drainDrop.incrementAndGet(); }
     void lateDrop() { lateDrop.incrementAndGet(); }
@@ -76,16 +100,23 @@ final class PacingDiag {
         }
     }
 
-    /** PTS recorded for a queued buffer, or -1 if unknown. */
-    long ptsOf(int bufferIndex) {
+    /**
+     * Take the PTS recorded for a queued buffer and clear its slot, or -1 if unknown.
+     * Call this when the buffer leaves the queue, BEFORE releasing it to the codec:
+     * after release the codec may hand the same index out again.
+     */
+    long takePts(int bufferIndex) {
         if (bufferIndex >= 0 && bufferIndex < PTS_SLOTS) {
-            return ptsByIndex.get(bufferIndex);
+            return ptsByIndex.getAndSet(bufferIndex, -1);
         }
         return -1;
     }
 
     /**
-     * A frame was released for display.
+     * A frame was released for display. Call only after the release call succeeded.
+     * Note: this bookkeeping runs after the release, under a lock, on whichever
+     * thread released the frame. It records the order in which releases were
+     * counted, which can differ slightly from the order the codec received them.
      *
      * @param path        one of the PATH_ constants
      * @param ptsUs       the frame's presentation timestamp, or -1 if unknown
@@ -133,7 +164,7 @@ final class PacingDiag {
     }
 
     private void report(long now) {
-        long[] cur = new long[16];
+        long[] cur = new long[18];
         String ex;
         synchronized (this) {
             cur[0] = submitted.get();
@@ -151,6 +182,8 @@ final class PacingDiag {
             cur[12] = releasedWhileQueued;
             cur[13] = outOfOrder;
             cur[14] = resets.get();
+            cur[15] = outputReversal.get();
+            cur[16] = releaseFailed.get();
             ex = examples.toString();
             examples.setLength(0);
             exampleCount = 0;
@@ -158,7 +191,7 @@ final class PacingDiag {
 
         String[] names = {"submitted", "output", "latestRel", "latestDrop", "queued", "queueDrop",
                 "choreoRel", "choreoEmpty", "choreoCallbacks", "directRel", "drainDrop", "lateDrop",
-                "relWhileQueued", "outOfOrder", "resets"};
+                "relWhileQueued", "outOfOrder", "resets", "outputReversal", "releaseFailed"};
         StringBuilder sb = new StringBuilder(320);
         sb.append("PacingDiag t=").append((now - sessionStartNs) / 1_000_000L).append("ms window=")
                 .append((now - windowStartNs) / 1_000_000L).append("ms");

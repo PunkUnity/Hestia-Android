@@ -67,7 +67,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
 
 
     // Helper: release with low-latency policy (immediate only when very near to now)
-    private void releaseWithPolicy(int bufferIndex, long frameTimeNanos) {
+    private boolean releaseWithPolicy(int bufferIndex, long frameTimeNanos) {
         try {
             long now = System.nanoTime();
             boolean immediate = preferLowerDelays && (frameTimeNanos <= now + 300_000L);
@@ -76,12 +76,15 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
             } else {
                 videoDecoder.releaseOutputBuffer(bufferIndex, frameTimeNanos);
             }
+            return true;
         } catch (Throwable t) {
             try {
                 // Fallback to immediate if timestamped release fails for any reason
                 videoDecoder.releaseOutputBuffer(bufferIndex, true);
+                return true;
             } catch (Throwable ignored) {}
         }
+        return false;
     }
     private int getOutputDequeueTimeoutUs(){ return preferLowerDelays ? Math.max(250, preferLowerDelaysTimeoutUs) : preferLowerDelaysTimeoutUs; }
 
@@ -1109,6 +1112,8 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
             Integer nextOutputBuffer = outputBufferQueue.poll();
             if (nextOutputBuffer == null) pacingDiag.choreoEmpty();
             if (nextOutputBuffer != null) {
+                // Take the PTS while this index is still ours; the codec may reuse it after release.
+                final long diagPtsUs = pacingDiag.takePts(nextOutputBuffer);
                 try {
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
                         if (preferLowerDelays) {
@@ -1131,9 +1136,10 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                     }
 
                     lastRenderedFrameTimeNanos = frameTimeNanos;
-                    pacingDiag.released(PacingDiag.PATH_CHOREO, pacingDiag.ptsOf(nextOutputBuffer), outputBufferQueue.size());
+                    pacingDiag.released(PacingDiag.PATH_CHOREO, diagPtsUs, outputBufferQueue.size());
                     activeWindowVideoStats.totalFramesRendered++;
                 } catch (IllegalStateException ignored) {
+                    pacingDiag.releaseFailed();
                     try {
                         // Try to avoid leaking the output buffer by releasing it without rendering
                         videoDecoder.releaseOutputBuffer(nextOutputBuffer, false);
@@ -1255,18 +1261,19 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                                     pacingDiag.latestDrop();
                                 }
                                 __last = __idx;
-                                pacingDiag.output();
+                                pacingDiag.output(__tmpInfo.presentationTimeUs);
                                 __lastPtsUs = __tmpInfo.presentationTimeUs;
                                 __idx = videoDecoder.dequeueOutputBuffer(__tmpInfo, 0);
                             }
 
                             if (__last >= 0) {
                                 long __nowNs = System.nanoTime();
+                                boolean __diagReleased;
                                 if (android.os.Build.VERSION.SDK_INT >= 21) {
-                                    releaseWithPolicy(__last, System.nanoTime());} else {
-                                    releaseWithPolicy(__last, System.nanoTime());}
+                                    __diagReleased = releaseWithPolicy(__last, System.nanoTime());} else {
+                                    __diagReleased = releaseWithPolicy(__last, System.nanoTime());}
 
-                                pacingDiag.released(PacingDiag.PATH_LATEST, __lastPtsUs, outputBufferQueue.size());
+                                if (__diagReleased) pacingDiag.released(PacingDiag.PATH_LATEST, __lastPtsUs, outputBufferQueue.size()); else pacingDiag.releaseFailed();
                                 // Update decode->present EWMA and decode stats if we have a valid PTS
                                 if (__lastPtsUs >= 0) {
                                     long __d2pNs = __nowNs - (__lastPtsUs * 1000L);
@@ -1303,7 +1310,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                             int lastIndex = outIndex;
 
                             numFramesOut++;
-                            pacingDiag.output();
+                            pacingDiag.output(info.presentationTimeUs);
 
                             // aggiorna inter-arrival
                             if (lastDecoderPtsUs != 0L) {
@@ -1324,7 +1331,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                                     pacingDiag.drainDrop();
 
                                     numFramesOut++;
-                                    pacingDiag.output();
+                                    pacingDiag.output(info.presentationTimeUs);
                                     lastIndex = outIndex;
                                     presentationTimeUs = info.presentationTimeUs;
                                 }
