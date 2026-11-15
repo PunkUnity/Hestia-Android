@@ -1242,8 +1242,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                             + " appliedFramePacing=" + (prefs != null ? prefs.framePacing : -1)
                             + " preferLowerDelays=" + preferLowerDelays + " dequeueTimeoutUs=" + getOutputDequeueTimeoutUs()
                             + " forceTightThresholds=" + forceTightThresholds
-                            + " latestOnlyActive=" + (!preferLowerDelays && !managedMode)
-                            + " choreographerThread=" + (choreographerHandlerThread != null));
+                            + " latestOnlyActive=" + (!preferLowerDelays && !managedMode));
                 }
                 long lastOutputNs = System.nanoTime();
                 while (!stopping) {
