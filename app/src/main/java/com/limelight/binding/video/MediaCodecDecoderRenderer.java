@@ -1114,11 +1114,12 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
             if (nextOutputBuffer != null) {
                 // Take the PTS while this index is still ours; the codec may reuse it after release.
                 final long diagPtsUs = pacingDiag.takePts(nextOutputBuffer);
+                boolean diagReleased = true;
                 try {
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
                         if (preferLowerDelays) {
                             // ULL: present at next VSYNC (no scheduling)
-                            releaseWithPolicy(nextOutputBuffer, System.nanoTime());} else {
+                            diagReleased = releaseWithPolicy(nextOutputBuffer, System.nanoTime());} else {
                             // Smooth/Balanced: keep timestamp scheduling
                             videoDecoder.releaseOutputBuffer(nextOutputBuffer, frameTimeNanos);
                         }
@@ -1127,16 +1128,20 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                     else {
                         if (android.os.Build.VERSION.SDK_INT >= 21) {
                             long __ts = System.nanoTime();
-                            releaseWithPolicy(nextOutputBuffer, System.nanoTime());} else {
+                            diagReleased = releaseWithPolicy(nextOutputBuffer, System.nanoTime());} else {
                             if (android.os.Build.VERSION.SDK_INT >= 21) {
                                 long __ts = System.nanoTime();
-                                releaseWithPolicy(nextOutputBuffer, frameTimeNanos);} else {
-                                releaseWithPolicy(nextOutputBuffer, frameTimeNanos);}
+                                diagReleased = releaseWithPolicy(nextOutputBuffer, frameTimeNanos);} else {
+                                diagReleased = releaseWithPolicy(nextOutputBuffer, frameTimeNanos);}
                         }
                     }
 
                     lastRenderedFrameTimeNanos = frameTimeNanos;
-                    pacingDiag.released(PacingDiag.PATH_CHOREO, diagPtsUs, outputBufferQueue.size());
+                    if (diagReleased) {
+                        pacingDiag.released(PacingDiag.PATH_CHOREO, diagPtsUs, outputBufferQueue.size());
+                    } else {
+                        pacingDiag.releaseFailed();
+                    }
                     activeWindowVideoStats.totalFramesRendered++;
                 } catch (IllegalStateException ignored) {
                     pacingDiag.releaseFailed();
